@@ -29,18 +29,31 @@
 #include "cJSON.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
+#include "ultrasonic.h"
 
 /*------------------------------------------------------------------------------
 PROGRAM CONSTANTS
 ------------------------------------------------------------------------------*/
+// Name Tag For Function
 #define TAG "ServoMotor"
+// API
+#define WRITE_ULTRASONIC_API "JAZNX114ESE9G465"
+#define WRITE_PIR_API "0UDMEUVJMS6YQ118"
+#define READ_API "8FB4KKVVEHU5ALBV"
+#define CHANNEL "2987995"
+// Pin
 #define SERVO_GPIO GPIO_NUM_13
 #define LED_GPIO GPIO_NUM_2
-
+#define PIR_SENSOR_GPIO GPIO_NUM_4
+#define TRIGGER_GPIO GPIO_NUM_5
+#define ECHO_GPIO GPIO_NUM_18
+// Other
+#define MAX_DISTANCE_CM 500 // 5m max
 /*------------------------------------------------------------------------------
  GLOBAL VARIABLES
 ------------------------------------------------------------------------------*/
 static bool gate_is_open = false;
+static float last_distance_cm = -1;
 
 /*------------------------------------------------------------------------------
  FUNCTION DECLARATIONS
@@ -60,6 +73,14 @@ void open_gate();
 void close_gate();
 // LED
 void toggle_led(uint8_t state);
+// HC-SR04
+void ultrasonic_task(void *pvParameters);
+void send_task(void *pvParameters);
+void send_ultrasonic_to_thingspeak(int value);
+// HC-SR501
+void configure_pir_sensor();
+void monitor_pir_sensor();
+void send_pir_to_thingspeak(int value);
 /*------------------------------------------------------------------------------
  MAIN FUNCTION
 ------------------------------------------------------------------------------*/
@@ -128,6 +149,7 @@ void wifi_connection()
             .ssid = SSID,
             .password = PASS}};
     esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_configuration);
+    esp_wifi_set_mode(WIFI_MODE_STA);
     // 3 - Wi-Fi Start Phase
     esp_wifi_start();
     // 4- Wi-Fi Connect Phase
@@ -185,8 +207,9 @@ esp_err_t client_event_get_handler(esp_http_client_event_handle_t evt)
 
 static void rest_get()
 {
+    
     esp_http_client_config_t config_get = {
-        .url = "http://api.thingspeak.com/channels/2987995/fields/1/last.json?api_key=8FB4KKVVEHU5ALBV",
+        .url = "http://api.thingspeak.com/channels/"CHANNEL"/fields/1/last.json?api_key="READ_API,
         .method = HTTP_METHOD_GET,
         .cert_pem = NULL,
         .event_handler = client_event_get_handler};
@@ -251,6 +274,7 @@ void close_gate(){
     }
 }
 
+/* Function to control LED */
 
 void toggle_led(uint8_t state) {
     gpio_set_direction(LED_GPIO,GPIO_MODE_OUTPUT);
@@ -261,4 +285,104 @@ void toggle_led(uint8_t state) {
         gpio_set_level(LED_GPIO, 0);  // Turn LED OFF
         ESP_LOGI(TAG, "LED OFF");
     }
+}
+
+/* Function to control HC-SR04 */
+
+void ultrasonic_task(void *pvParameters)
+{
+    ultrasonic_sensor_t sensor = {
+        .trigger_pin = TRIGGER_GPIO,
+        .echo_pin = ECHO_GPIO
+    };
+
+    ultrasonic_init(&sensor);
+
+    while (true)
+    {
+        float distance;
+        esp_err_t res = ultrasonic_measure(&sensor, MAX_DISTANCE_CM, &distance);
+        if (res == ESP_OK) {
+            last_distance_cm = distance * 100.0;
+            printf("Distance: %.2f cm\n", last_distance_cm);
+
+            if (last_distance_cm < 12.0) {
+                printf("Car is in garage\n");
+            }
+        } else {
+            printf("Ultrasonic error: %s\n", esp_err_to_name(res));
+            last_distance_cm = -1; // indicate invalid
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+
+void send_task(void *pvParameters)
+{
+    while (true)
+    {
+        if (last_distance_cm >= 0) {
+            send_ultrasonic_to_thingspeak((int)last_distance_cm);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Send every 5 seconds
+    }
+}
+
+void send_ultrasonic_to_thingspeak(int value) {
+    char url[256];
+    snprintf(url, sizeof(url),
+        "http://api.thingspeak.com/update?api_key=%s&field1=%d", WRITE_ULTRASONIC_API, value);
+
+    esp_http_client_config_t config = {
+        .url = url,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+}
+
+/* Function to control HC-SR501 */
+
+void configure_pir_sensor() {
+    gpio_set_direction(PIR_SENSOR_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIR_SENSOR_GPIO, GPIO_PULLDOWN_ONLY);
+    printf("✅ Monitoring PIR on GPIO %d\n", PIR_SENSOR_GPIO);
+}
+
+void monitor_pir_sensor() {
+    int last_state = 0;
+    while (1) {
+        int state = gpio_get_level(PIR_SENSOR_GPIO);
+
+        if (state != last_state) {
+            if (state) {
+                printf("ALERT: Motion detected!\n");
+                send_pir_to_thingspeak(1);  // Send "1" to ThingSpeak to indicate motion
+            } else {
+                printf("Clear.\n");
+                send_pir_to_thingspeak(0);  // Send "0" to ThingSpeak to indicate no motion
+            }
+            last_state = state;
+            if (state) vTaskDelay(pdMS_TO_TICKS(500));  // Debounce on detection
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));  // Polling interval
+    }
+}
+
+void send_pir_to_thingspeak(int value) {
+    char url[256];
+    snprintf(url, sizeof(url),
+        "http://api.thingspeak.com/update?api_key=%s&field1=%d", WRITE_PIR_API, value);
+
+    esp_http_client_config_t config = {
+        .url = url,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
 }
