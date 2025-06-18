@@ -10,12 +10,12 @@
  * 
  */
 
-
 /*------------------------------------------------------------------------------
  HEADERS
 ------------------------------------------------------------------------------*/
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -49,6 +49,7 @@ PROGRAM CONSTANTS
 #define ECHO_GPIO GPIO_NUM_18
 // Other
 #define MAX_DISTANCE_CM 500 // 5m max
+#define LED_ACTIVE_LOW 1    // Active-low LED (1 = ON when low, 0 = ON when high)
 /*------------------------------------------------------------------------------
  GLOBAL VARIABLES
 ------------------------------------------------------------------------------*/
@@ -60,19 +61,22 @@ static float last_distance_cm = -1;
 ------------------------------------------------------------------------------*/
 /* Configuration */
 void pwm_init(void);
+void led_init(void);
 /* Normal Function */
 void gate_control_task(void *pvParameters);
 // Read Value
 static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 void wifi_connection();
 esp_err_t client_event_get_handler(esp_http_client_event_handle_t evt);
-static void rest_get();
+static void read_gate();
+static void read_led();
 // Servo
 uint32_t angle_to_duty_cycle(uint8_t angle);
 void open_gate();
 void close_gate();
 // LED
 void toggle_led(uint8_t state);
+void read_led();
 // HC-SR04
 void ultrasonic_task(void *pvParameters);
 void send_task(void *pvParameters);
@@ -89,28 +93,43 @@ void app_main(void)
     nvs_flash_init();
     wifi_connection();
     pwm_init();
+    led_init();
 
     vTaskDelay(2000 / portTICK_PERIOD_MS);
     printf("WIFI was initiated ...........\n\n");
 
+    // Test LED during startup
+    printf("Testing LED...\n");
+    toggle_led(1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    toggle_led(0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("LED test complete\n");
+
     xTaskCreate(gate_control_task, "gate_control_task", 4096, NULL, 5, NULL);
-
 }
-
 
 /*------------------------------------------------------------------------------
  FUNCTION DEFINITIONS
 ------------------------------------------------------------------------------*/
 
+void led_init(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, LED_ACTIVE_LOW ? 1 : 0); // Initialize LED to OFF
+    ESP_LOGI(TAG, "LED initialized on GPIO %d (active-%s)", LED_GPIO, LED_ACTIVE_LOW ? "low" : "high");
+}
+
 void gate_control_task(void *pvParameters) {
     while (1) {
-        rest_get();
+        read_gate();
+        read_led();
         vTaskDelay(pdMS_TO_TICKS(10000)); // Check every 10 seconds
     }
 }
 
-
-/*  Function for read data from ThingSpeak  */
+/* Function for read data from ThingSpeak */
 
 static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -162,52 +181,69 @@ esp_err_t client_event_get_handler(esp_http_client_event_handle_t evt)
     {
     case HTTP_EVENT_ON_DATA:
     {
+        // Log raw response for debugging
         char *json_data = (char *)evt->data;
+        printf("Raw response: %.*s\n", evt->data_len, json_data);
 
+        // Check if data is empty or null
+        if (evt->data_len == 0 || json_data == NULL) {
+            printf("Empty or null response from ThingSpeak\n");
+            break;
+        }
+
+        // Parse JSON
         cJSON *root = cJSON_ParseWithLength(json_data, evt->data_len);
         if (root == NULL) {
             printf("Error parsing JSON\n");
             break;
         }
 
+        // Get field1 (for gate) and field2 (for LED)
         cJSON *field1 = cJSON_GetObjectItem(root, "field1");
-        if (cJSON_IsString(field1) && field1->valuestring != NULL) {
+        cJSON *field2 = cJSON_GetObjectItem(root, "field2");
+
+        // Process field1 for gate control
+        if (cJSON_IsString(field1) && field1->valuestring != NULL && (strcmp(field1->valuestring, "0") == 0 || strcmp(field1->valuestring, "1") == 0)) {
             printf("Field1 value: %s\n", field1->valuestring);
-            if (strcmp(field1->valuestring, "0") == 0 || strcmp(field1->valuestring, "1") == 0) {
-                toggle_led(atoi(field1->valuestring));
-                if (atoi(field1->valuestring)) {
-                    if (!gate_is_open) {
-                        open_gate();
-                        gate_is_open = true;
-                        ESP_LOGI(TAG, "Gate opened");
-                    }
-                } else {
-                    if (gate_is_open) {
-                        close_gate();
-                        gate_is_open = false;
-                        ESP_LOGI(TAG, "Gate closed");
-                    }
+            if (atoi(field1->valuestring)) {
+                if (!gate_is_open) {
+                    open_gate();
+                    gate_is_open = true;
+                    ESP_LOGI(TAG, "Gate opened");
                 }
             } else {
-                printf("Field1 is not 0 or 1\n");
+                if (gate_is_open) {
+                    close_gate();
+                    gate_is_open = false;
+                    ESP_LOGI(TAG, "Gate closed");
+                }
             }
         } else {
-            printf("field1 is missing or not a string\n");
+            printf("field1 is missing, not a string, or invalid value\n");
+        }
+
+        // Process field2 for LED control
+        if (cJSON_IsString(field2) && field2->valuestring != NULL && (strcmp(field2->valuestring, "0") == 0 || strcmp(field2->valuestring, "1") == 0)) {
+            printf("Field2 value: %s\n", field2->valuestring);
+            toggle_led(atoi(field2->valuestring));
+        } else {
+            printf("field2 is missing, not a string, or invalid value\n");
         }
 
         cJSON_Delete(root);
         break;
     }
-
+    case HTTP_EVENT_ERROR:
+        printf("HTTP client error\n");
+        break;
     default:
         break;
     }
     return ESP_OK;
 }
 
-static void rest_get()
+static void read_gate()
 {
-    
     esp_http_client_config_t config_get = {
         .url = "http://api.thingspeak.com/channels/"CHANNEL"/fields/1/last.json?api_key="READ_API,
         .method = HTTP_METHOD_GET,
@@ -215,19 +251,36 @@ static void rest_get()
         .event_handler = client_event_get_handler};
         
     esp_http_client_handle_t client = esp_http_client_init(&config_get);
-    esp_http_client_perform(client);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        printf("HTTP request failed for read_gate: %s\n", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+static void read_led()
+{
+    esp_http_client_config_t config_get = {
+        .url = "http://api.thingspeak.com/channels/"CHANNEL"/fields/2/last.json?api_key="READ_API,
+        .method = HTTP_METHOD_GET,
+        .cert_pem = NULL,
+        .event_handler = client_event_get_handler};
+        
+    esp_http_client_handle_t client = esp_http_client_init(&config_get);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        printf("HTTP request failed for read_led: %s\n", esp_err_to_name(err));
+    }
     esp_http_client_cleanup(client);
 }
 
 /* Function for Servo */
 
-uint32_t angle_to_duty_cycle(uint8_t angle)
-{
+uint32_t angle_to_duty_cycle(uint8_t angle) {
     if (angle > 180) angle = 180;
-    // Map angle (0° -> 0.5ms, 180° -> 2.5ms)
-    float pulse_width = 0.5 + (angle / 180.0) * 2.0;
-    // Convert pulse width to duty cycle (12-bit resolution, 50Hz)
-    uint32_t duty = (pulse_width / 20.0) * 4096;
+    // Map angle (0° -> 0.5ms, 180° -> 2.5ms) for 50Hz (20ms period)
+    uint32_t pulse_width_us = 500 + (angle * 2000 / 180); // 500us to 2500us
+    uint32_t duty = (pulse_width_us * 4096) / 20000; // 4096 (12-bit) / 20ms
     return duty;
 }
 
@@ -252,7 +305,6 @@ void pwm_init(void){
         .timer_sel = LEDC_TIMER_0
     };
     ledc_channel_config(&ledc_channel);
-
 }
 
 void open_gate(){
@@ -260,31 +312,27 @@ void open_gate(){
         ESP_LOGI(TAG, "Moving to %d degrees", angle);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, angle_to_duty_cycle(angle));
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
-
 
 void close_gate(){
     for(int angle = 170; angle >= 65; angle -= 2) {
         ESP_LOGI(TAG, "Moving to %d degrees", angle);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, angle_to_duty_cycle(angle));
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 /* Function to control LED */
 
 void toggle_led(uint8_t state) {
-    gpio_set_direction(LED_GPIO,GPIO_MODE_OUTPUT);
-    if (state == 1) {
-        gpio_set_level(LED_GPIO, 1);  // Turn LED ON
-        ESP_LOGI(TAG, "LED ON");
-    } else {
-        gpio_set_level(LED_GPIO, 0);  // Turn LED OFF
-        ESP_LOGI(TAG, "LED OFF");
-    }
+    // Active-low: state 1 -> GPIO low (ON), state 0 -> GPIO high (OFF)
+    // Active-high: state 1 -> GPIO high (ON), state 0 -> GPIO low (OFF)
+    int level = LED_ACTIVE_LOW ? state : !state;
+    gpio_set_level(LED_GPIO, level);
+    ESP_LOGI(TAG, "LED set to %s (GPIO %d = %d)", state ? "ON" : "OFF", LED_GPIO, level);
 }
 
 /* Function to control HC-SR04 */
@@ -317,7 +365,6 @@ void ultrasonic_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
-
 
 void send_task(void *pvParameters)
 {
