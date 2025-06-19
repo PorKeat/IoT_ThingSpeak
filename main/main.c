@@ -30,6 +30,7 @@
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "ultrasonic.h"
+#include "esp_timer.h"
 
 /*------------------------------------------------------------------------------
 PROGRAM CONSTANTS
@@ -39,6 +40,7 @@ PROGRAM CONSTANTS
 // API
 #define WRITE_ULTRASONIC_API "JAZNX114ESE9G465"
 #define WRITE_PIR_API "0UDMEUVJMS6YQ118"
+#define WRITE_BACK "2GFHPT1S2DZLVPHH"
 #define READ_API "8FB4KKVVEHU5ALBV"
 #define CHANNEL "2987995"
 // Pin
@@ -49,19 +51,22 @@ PROGRAM CONSTANTS
 #define ECHO_GPIO GPIO_NUM_18
 // Other
 #define MAX_DISTANCE_CM 500 // 5m max
-#define LED_ACTIVE_LOW 1    // Active-low LED (1 = ON when low, 0 = ON when high)
+#define ULTRASONIC_SAMPLE_COUNT 5
+#define DISTANCE_CHANGE_THRESHOLD_CM 20.0   // Only accept if change is greater than this
+#define STABLE_DETECTION_INTERVAL_MS 2000   // Minimum time between valid detection events
 /*------------------------------------------------------------------------------
  GLOBAL VARIABLES
 ------------------------------------------------------------------------------*/
 static bool gate_is_open = false;
 static float last_distance_cm = -1;
+static int last_led_state = 0; // 0 = OFF, 1 = ON
+static int64_t last_gate_action_time_us = 0;
 
 /*------------------------------------------------------------------------------
  FUNCTION DECLARATIONS
 ------------------------------------------------------------------------------*/
 /* Configuration */
 void pwm_init(void);
-void led_init(void);
 /* Normal Function */
 void gate_control_task(void *pvParameters);
 // Read Value
@@ -74,11 +79,13 @@ static void read_led();
 uint32_t angle_to_duty_cycle(uint8_t angle);
 void open_gate();
 void close_gate();
+void send_garage_data_back(int value);
 // LED
 void toggle_led(uint8_t state);
 void read_led();
 // HC-SR04
-void ultrasonic_task(void *pvParameters);
+float get_ultrasonic_distance_cm();
+void monitor_ultrasonic_task(void *pvParameters);
 void send_task(void *pvParameters);
 void send_ultrasonic_to_thingspeak(int value);
 // HC-SR501
@@ -93,33 +100,19 @@ void app_main(void)
     nvs_flash_init();
     wifi_connection();
     pwm_init();
-    led_init();
 
     vTaskDelay(2000 / portTICK_PERIOD_MS);
     printf("WIFI was initiated ...........\n\n");
 
-    // Test LED during startup
-    printf("Testing LED...\n");
-    toggle_led(1);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    toggle_led(0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    printf("LED test complete\n");
-
     xTaskCreate(gate_control_task, "gate_control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(monitor_ultrasonic_task, "monitor_ultrasonic_task", 4096, NULL, 4, NULL);
+    xTaskCreate(send_task, "send_task", 4096, NULL, 3, NULL);
 }
+
 
 /*------------------------------------------------------------------------------
  FUNCTION DEFINITIONS
 ------------------------------------------------------------------------------*/
-
-void led_init(void)
-{
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, LED_ACTIVE_LOW ? 1 : 0); // Initialize LED to OFF
-    ESP_LOGI(TAG, "LED initialized on GPIO %d (active-%s)", LED_GPIO, LED_ACTIVE_LOW ? "low" : "high");
-}
 
 void gate_control_task(void *pvParameters) {
     while (1) {
@@ -185,7 +178,7 @@ esp_err_t client_event_get_handler(esp_http_client_event_handle_t evt)
         char *json_data = (char *)evt->data;
         printf("Raw response: %.*s\n", evt->data_len, json_data);
 
-        // Check if data is empty or null
+        // Check if data is empty or too short
         if (evt->data_len == 0 || json_data == NULL) {
             printf("Empty or null response from ThingSpeak\n");
             break;
@@ -225,7 +218,8 @@ esp_err_t client_event_get_handler(esp_http_client_event_handle_t evt)
         // Process field2 for LED control
         if (cJSON_IsString(field2) && field2->valuestring != NULL && (strcmp(field2->valuestring, "0") == 0 || strcmp(field2->valuestring, "1") == 0)) {
             printf("Field2 value: %s\n", field2->valuestring);
-            toggle_led(atoi(field2->valuestring));
+            int check = atoi(field2->valuestring);
+            toggle_led(check);
         } else {
             printf("field2 is missing, not a string, or invalid value\n");
         }
@@ -323,22 +317,49 @@ void close_gate(){
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+
+    gate_is_open = false;
+    last_gate_action_time_us = esp_timer_get_time();  // ✅ Save time
+    send_garage_data_back(0);
+    ESP_LOGI(TAG, "Gate closed and notified ThingSpeak");
 }
+
+
+
+void send_garage_data_back(int value) {
+    char url[256];
+    snprintf(url, sizeof(url),
+        "http://api.thingspeak.com/update?api_key=%s&field1=%d&field2=%d", 
+        WRITE_BACK, value, last_led_state);
+
+    esp_http_client_config_t config = {
+        .url = url,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+}
+
 
 /* Function to control LED */
 
 void toggle_led(uint8_t state) {
-    // Active-low: state 1 -> GPIO low (ON), state 0 -> GPIO high (OFF)
-    // Active-high: state 1 -> GPIO high (ON), state 0 -> GPIO low (OFF)
-    int level = LED_ACTIVE_LOW ? state : !state;
-    gpio_set_level(LED_GPIO, level);
-    ESP_LOGI(TAG, "LED set to %s (GPIO %d = %d)", state ? "ON" : "OFF", LED_GPIO, level);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    if (state == 1) {
+        gpio_set_level(LED_GPIO, 1);
+        ESP_LOGI(TAG, "LED ON");
+    } else {
+        gpio_set_level(LED_GPIO, 0);
+        ESP_LOGI(TAG, "LED OFF");
+    }
+    last_led_state = state;
 }
+
 
 /* Function to control HC-SR04 */
 
-void ultrasonic_task(void *pvParameters)
-{
+float get_ultrasonic_distance_cm() {
     ultrasonic_sensor_t sensor = {
         .trigger_pin = TRIGGER_GPIO,
         .echo_pin = ECHO_GPIO
@@ -346,36 +367,53 @@ void ultrasonic_task(void *pvParameters)
 
     ultrasonic_init(&sensor);
 
-    while (true)
-    {
-        float distance;
-        esp_err_t res = ultrasonic_measure(&sensor, MAX_DISTANCE_CM, &distance);
-        if (res == ESP_OK) {
-            last_distance_cm = distance * 100.0;
-            printf("Distance: %.2f cm\n", last_distance_cm);
-
-            if (last_distance_cm < 12.0) {
-                printf("Car is in garage\n");
-            }
-        } else {
-            printf("Ultrasonic error: %s\n", esp_err_to_name(res));
-            last_distance_cm = -1; // indicate invalid
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
+    float distance;
+    esp_err_t res = ultrasonic_measure(&sensor, MAX_DISTANCE_CM, &distance);
+    if (res == ESP_OK) {
+        return distance * 100.0;
+    } else {
+        ESP_LOGW(TAG, "Ultrasonic error: %s", esp_err_to_name(res));
+        return -1.0;
     }
 }
+
+void monitor_ultrasonic_task(void *pvParameters) {
+    while (1) {
+        last_distance_cm = get_ultrasonic_distance_cm();
+        if (last_distance_cm > 0) {
+            ESP_LOGI(TAG, "Distance: %.2f cm", last_distance_cm);
+
+            float threshold = (last_led_state == 1) ? 20.0 : 12.0;
+
+            int64_t now = esp_timer_get_time();
+            bool recently_closed = (now - last_gate_action_time_us) < 8000000; // 8 seconds in microseconds
+
+            if (!recently_closed && last_distance_cm < threshold) {
+                if (gate_is_open) {
+                    close_gate();
+                }
+                printf("\nCar Detected! (Threshold: %.1f cm)\n", threshold);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+
+
 
 void send_task(void *pvParameters)
 {
     while (true)
     {
-        if (last_distance_cm >= 0) {
+        if (!gate_is_open && last_distance_cm >= 0) {  // <-- Only send if gate is closed
             send_ultrasonic_to_thingspeak((int)last_distance_cm);
         }
         vTaskDelay(pdMS_TO_TICKS(5000)); // Send every 5 seconds
     }
 }
+
 
 void send_ultrasonic_to_thingspeak(int value) {
     char url[256];
